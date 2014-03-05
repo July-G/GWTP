@@ -16,13 +16,18 @@
 
 package com.gwtplatform.crawlerservice.server.guice;
 
-import javax.inject.Singleton;
-
 import com.gargoylesoftware.htmlunit.BrowserVersion;
 import com.gargoylesoftware.htmlunit.WebClient;
 import com.google.inject.Provides;
 import com.google.inject.servlet.ServletModule;
+import com.googlecode.objectify.ObjectifyFilter;
+import com.gwtplatform.crawlerservice.server.ClearPage;
 import com.gwtplatform.crawlerservice.server.CrawlServiceServlet;
+import com.gwtplatform.crawlerservice.server.domain.CachedPage;
+
+import javax.inject.Singleton;
+
+import static com.googlecode.objectify.ObjectifyService.factory;
 
 /**
  * @author Philippe Beaudoin
@@ -31,7 +36,16 @@ public class CrawlServiceModule extends ServletModule {
 
     @Override
     public void configureServlets() {
+        factory().register(CachedPage.class);
+
+        bind(ObjectifyFilter.class).in(com.google.inject.Singleton.class);
+        filter("/*").through(ObjectifyFilter.class);
         serve("*").with(CrawlServiceServlet.class);
+        serve("/cron/delpages").with(ClearPage.class);
+        //exclude the local admin modu
+        //below should work but actully not, so use Salomon BRYS method to solave this:
+        //http://stackoverflow.com/questions/2857279/google-guice-on-google-appengine-mapping-with-working-ah
+//        serveRegex("/(?!_ah).*").with(CrawlServiceServlet.class);
     }
 
     @Singleton

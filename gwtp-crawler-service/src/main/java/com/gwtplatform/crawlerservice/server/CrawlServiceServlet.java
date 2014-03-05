@@ -16,21 +16,6 @@
 
 package com.gwtplatform.crawlerservice.server;
 
-import java.io.IOException;
-import java.io.PrintWriter;
-import java.net.URLDecoder;
-import java.util.Date;
-import java.util.List;
-import java.util.Map;
-import java.util.logging.Level;
-import java.util.logging.Logger;
-
-import javax.inject.Provider;
-import javax.inject.Singleton;
-import javax.servlet.http.HttpServlet;
-import javax.servlet.http.HttpServletRequest;
-import javax.servlet.http.HttpServletResponse;
-
 import com.gargoylesoftware.htmlunit.NicelyResynchronizingAjaxController;
 import com.gargoylesoftware.htmlunit.SilentCssErrorHandler;
 import com.gargoylesoftware.htmlunit.WebClient;
@@ -38,9 +23,21 @@ import com.gargoylesoftware.htmlunit.WebRequest;
 import com.gargoylesoftware.htmlunit.html.HtmlPage;
 import com.google.common.base.Strings;
 import com.google.inject.Inject;
-import com.googlecode.objectify.Key;
 import com.gwtplatform.crawlerservice.server.domain.CachedPage;
-import com.gwtplatform.crawlerservice.server.service.CachedPageDao;
+
+import javax.inject.Provider;
+import javax.inject.Singleton;
+import javax.servlet.http.HttpServlet;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.net.URLDecoder;
+import java.util.Date;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+import static com.googlecode.objectify.ObjectifyService.ofy;
 
 /**
  * Servlet that makes it possible to fetch an external page, renders it using HTMLUnit and returns the HTML page.
@@ -70,24 +67,19 @@ public class CrawlServiceServlet extends HttpServlet {
 
     @Inject(optional = true)
     @CachedPageTimeoutSec
-    private long cachedPageTimeoutSec = 15 * 60;
+    public static long cachedPageTimeoutSec = 15 * 60;
 
     private final Logger log;
     private final Provider<WebClient> webClientProvider;
 
     private final String key;
 
-    private final CachedPageDao cachedPageDao;
 
     @Inject
-    CrawlServiceServlet(Provider<WebClient> webClientProvider,
-                        Logger log,
-                        CachedPageDao cachedPageDao,
-                        @ServiceKey String key) {
+    CrawlServiceServlet(Provider<WebClient> webClientProvider, Logger log, @ServiceKey String key) {
         this.webClientProvider = webClientProvider;
         this.log = log;
         this.key = key;
-        this.cachedPageDao = cachedPageDao;
     }
 
     @Override
@@ -117,8 +109,7 @@ public class CrawlServiceServlet extends HttpServlet {
         }
     }
 
-    private boolean validateKey(HttpServletRequest request, HttpServletResponse response)
-            throws IOException {
+    private boolean validateKey(HttpServletRequest request, HttpServletResponse response) throws IOException {
         PrintWriter output = response.getWriter();
         String receivedKey = request.getParameter("key");
         boolean keyIsValid = false;
@@ -148,70 +139,85 @@ public class CrawlServiceServlet extends HttpServlet {
         response.setCharacterEncoding(CHAR_ENCODING);
         response.setHeader("Content-Type", "text/plain; charset=" + CHAR_ENCODING);
 
-        List<Key<CachedPage>> keys = cachedPageDao.listKeysByProperty("url", url);
-        Map<Key<CachedPage>, CachedPage> deprecatedPages = cachedPageDao.get(keys);
+        log.info("find existing page from datastore which url equals: " + url);
+        CachedPage fetchedPage = ofy().load().type(CachedPage.class).id(url).now();
+        log.info("fetched page: " + fetchedPage);
 
         Date currDate = new Date();
 
-        CachedPage matchingPage = extractMatchingPage(deprecatedPages, currDate);
-        cachedPageDao.deleteKeys(deprecatedPages.keySet());
+        if (!needToFetchPage2(fetchedPage, currDate)) {
+            if (fetchedPage.isFetchInProgress()) {
+                log.info("no need to fetch page: fetch in progress.");
+                out.println("FETCH_IN_PROGRESS");
+            } else {
+                log.info("no need to fetch page: use page in datastore.");
+                out.println(fetchedPage.getContent());
+            }
+        } else {
+            //fetch now!
+            log.info("about to fetch page!");
+            if (fetchedPage != null) {
+                log.info("delete expired page in datastore");
+                ofy().delete().entity(fetchedPage).now();
+            }
 
-        if (needToFetchPage(matchingPage, currDate, out)) {
-            CachedPage cachedPage = createPlaceholderPage(url, currDate);
-            String renderedHtml = renderPage(url);
-            storeFetchedPage(cachedPage, renderedHtml);
+            log.info("save a new page to datastore and mark fetching is true");
+            CachedPage newPage = createPlaceholderPage(url, currDate);
+            //must store it in datastore to indicating next impatient Google Bot request that a fetch is in progress
+            ofy().save().entity(newPage).now();
+            String renderedHtml = fetchPage(url);
+            log.info("save the new page with page content to datastore");
+            saveFetchedPage(newPage, renderedHtml);
             out.println(renderedHtml);
         }
     }
 
-    private void storeFetchedPage(CachedPage cachedPage, String stringBuilder) {
-        cachedPage.setContent(stringBuilder);
-        cachedPage.setFetchInProgress(false);
-        cachedPageDao.put(cachedPage);
+    private boolean isFetchingExpired(CachedPage fetchedPage, Date currDate) {
+        //gae urlfetch deadline is 60 seconds
+        // If fetch is in progress since more than 60 seconds, we consider something went wrong and fetch again.
+        return currDate.getTime() > fetchedPage.getFetchDate().getTime() + 60000;
     }
 
-    /**
-     * Checks if the page {@link matchingPage} needs to be fetched. If it does not need to be fetched, but a fetch is
-     * already in progress, then it prints out {@code FETCH_IN_PROGRESS} to the specified {@link PrintWriter}.
-     *
-     * @param matchingPage The matching page, can be {@code null} if no page matches.
-     * @param currDate     The current date.
-     * @param out          The {@link PrintWriter} to write to, if needed.
-     * @return {@code true} if the page needs to be fetched, {@code false} otherwise.
-     */
-    private boolean needToFetchPage(CachedPage matchingPage, Date currDate, PrintWriter out) {
-        if (matchingPage == null) {
+    private boolean isDbPageExpired(CachedPage fetchedPage, Date currDate) {
+        //gae urlfetch deadline is 60 seconds
+        // If fetch is in progress since more than 60 seconds, we consider something went wrong and fetch again.
+        return currDate.getTime() > fetchedPage.getFetchDate().getTime() + cachedPageTimeoutSec * 1000;
+    }
+
+    private void saveFetchedPage(CachedPage cachedPage, String stringBuilder) {
+        cachedPage.setContent(stringBuilder);
+        cachedPage.setFetchInProgress(false);
+        ofy().save().entity(cachedPage).now();
+    }
+
+    private boolean needToFetchPage2(CachedPage fetchedPage, Date currDate) {
+        if (fetchedPage == null) {
             return true;
         }
 
-        if (matchingPage.isFetchInProgress()) {
+        //the exising page is expired
+        if (isDbPageExpired(fetchedPage,currDate)) {
+            return true;
+        }
+
+        if (fetchedPage.isFetchInProgress()) {
+            //gae urlfetch deadline is 60 seconds
             // If fetch is in progress since more than 60 seconds, we consider something went wrong and fetch again.
-            if (currDate.getTime() > matchingPage.getFetchDate().getTime() + 60000) {
-                cachedPageDao.delete(matchingPage);
+            if (isFetchingExpired(fetchedPage, currDate)) {
                 return true;
             } else {
-                out.println("FETCH_IN_PROGRESS");
                 return false;
             }
         } else {
-            out.println(matchingPage.getContent());
             return false;
         }
     }
 
-    /**
-     * Creates a placeholder page for the given {@code url} and stores it in the datastore.
-     *
-     * @param url      The URL of the page for which to create a placeholder.
-     * @param currDate The current date, to mark the page.
-     * @return The newly created placeholder page.
-     */
     private CachedPage createPlaceholderPage(String url, Date currDate) {
         CachedPage result = new CachedPage();
         result.setUrl(url);
         result.setFetchDate(currDate);
         result.setFetchInProgress(true);
-        cachedPageDao.put(result);
         return result;
     }
 
@@ -222,7 +228,7 @@ public class CrawlServiceServlet extends HttpServlet {
      * @param url The URL of the page to render.
      * @return The rendered page, in a {@link StringBuilder}.
      */
-    private String renderPage(String url) throws IOException {
+    private String fetchPage(String url) throws IOException {
         WebClient webClient = webClientProvider.get();
 
         webClient.getCache().clear();
@@ -262,37 +268,4 @@ public class CrawlServiceServlet extends HttpServlet {
 
         return page.asXml();
     }
-
-    /**
-     * Checks if there is a page from {@code deprecatedPages} that is not expired. If there is more than one, choose the
-     * most recent. If one is found it is removed from the {@code deprecatedPages} list.
-     *
-     * @param deprecatedPages The list of pages that match the URL but that are expected to be.
-     * @param currDate        The current date, to check for expiration.
-     * @return The non-expired matching page if found, {@code null} otherwise.
-     */
-    private CachedPage extractMatchingPage(Map<Key<CachedPage>, CachedPage> deprecatedPages, Date currDate) {
-        CachedPage matchingPage = findMostRecentPage(deprecatedPages);
-
-        // Keep the matching page only if it has not expired
-        if (matchingPage == null ||
-            currDate.getTime() > matchingPage.getFetchDate().getTime() + cachedPageTimeoutSec * 1000) {
-            matchingPage = null;
-        } else {
-            deprecatedPages.remove(Key.create(CachedPage.class, matchingPage.getId()));
-        }
-
-        return matchingPage;
-    }
-
-    private CachedPage findMostRecentPage(Map<Key<CachedPage>, CachedPage> pages) {
-        CachedPage result = null;
-        for (CachedPage page : pages.values()) {
-            if (result == null || page.getFetchDate().after(result.getFetchDate())) {
-                result = page;
-            }
-        }
-        return result;
-    }
-
 }

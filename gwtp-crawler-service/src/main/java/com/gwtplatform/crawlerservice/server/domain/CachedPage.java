@@ -16,21 +16,30 @@
 
 package com.gwtplatform.crawlerservice.server.domain;
 
-import java.util.Date;
-
 import com.googlecode.objectify.annotation.Entity;
-import com.googlecode.objectify.annotation.Index;
+import com.googlecode.objectify.annotation.Id;
+
+import java.util.Date;
 
 /**
  * Stores a cached version of a page.
  */
 @Entity
-public class CachedPage extends DatastoreObject {
-    @Index
+public class CachedPage {
+    @Id
     private String url;
     private Date fetchDate;
     private boolean fetchInProgress;
     private String content;
+
+    @Override
+    public String toString() {
+        return "CachedPage{" +
+                "url='" + url + '\'' +
+                ", fetchDate=" + fetchDate +
+                ", fetchInProgress=" + fetchInProgress +
+                '}';
+    }
 
     public void setUrl(String url) {
         this.url = url;
