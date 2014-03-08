@@ -92,7 +92,8 @@ public class CrawlServiceServlet extends HttpServlet {
                 out = resp.getWriter();
 
                 String url = Strings.nullToEmpty(req.getParameter("url"));
-                url = URLDecoder.decode(url, CHAR_ENCODING);
+                //url is decoded after calling getParameter(), no need to decode again
+                //                url = URLDecoder.decode(url, CHAR_ENCODING);
 
                 if (!url.isEmpty()) {
                     renderResponse(url, resp);
